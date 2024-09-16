@@ -1,9 +1,8 @@
 from dataclasses import dataclass
+import math
 import torch
 import torch.nn  as nn
 from torch.nn import functional as F
-import math
-
 
 
 class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
@@ -15,22 +14,21 @@ class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # it is not bias, but openai used in gpt , actually it is kind of mask 
+        # it is not bias, but openai used in gpt , actually it is kind of mask, TODO check whether it is trainable or not 
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
-        
 
     def forward(self, x):
         B, T, C = x.size()
 
         # nice way to batch calculation
-        qkv = self.c_attn(x) 
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        qkv = self.c_attn(x) # (B, T, 3*n_embd)
+        q, k, v = qkv.split(self.n_embd, dim=2)       #q,k,v (B, T, n_embd)
 
-        q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)           # (B, T, n_head, hs)-> (B, n_head, T, hs)   hs*n_head==n_embd
         k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
 
-        att = q@k.transpose(-2, -1) * (1.0/math.sqrt(k.size(-1)))
+        att = q@k.transpose(-1, -2) * (1.0/math.sqrt(k.size(-1)))               # (B, n_head, T, T)
         att = att.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
         att = F.softmax(att, dim=-1)
 
@@ -38,8 +36,6 @@ class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
-
-
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -136,7 +132,7 @@ class GPT(nn.Module):
 
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, target=None):
         B, T = idx.size()
         token_emb = self.transformer.wte(idx)
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
