@@ -224,8 +224,9 @@ if __name__=="__main__":
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals())
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
