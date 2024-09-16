@@ -4,6 +4,8 @@ import torch
 import torch.nn  as nn
 from torch.nn import functional as F
 import tiktoken
+import time 
+import numpy as np
 
 class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
     def __init__(self, config):
@@ -187,9 +189,9 @@ class DataLoaderLite:
         current_buff = self.tokens[self.curr_position_ptr: self.curr_position_ptr + B*T+1]
         x = current_buff[:-1].view(B, T)
         y = current_buff[1:].view(B, T)
-        self.curr_position_ptr = self.curr_position_ptr + B*T
+        self.curr_position_ptr = self.curr_position_ptr + B*T+1
 
-        if self.curr_position_ptr+1 > len(self.tokens):
+        if self.curr_position_ptr+B*T+1 > len(self.tokens):
             self.curr_position_ptr = 0
         return x, y
 
@@ -209,16 +211,27 @@ if __name__=="__main__":
         device = "cuda"
     print(f"using device: {device}")
 
-    train_loader = DataLoaderLite(B=4, T=32)
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    train_loader = DataLoaderLite(B=16, T=1024)
+    torch.set_float32_matmul_precision("high")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
+        to= time.time()
         x, y =  train_loader.next_batch()
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad()
         logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
         loss.backward()
         optimizer.step()
-        print(f"{i} loss {loss}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1-to)*1000 # in msec
+        tokens_per_sec = (train_loader.B * train_loader.T) / (t1-to)
+        print(f"step {i} loss {loss}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:2f}")
 
     # loss reaches from 11 to 6
