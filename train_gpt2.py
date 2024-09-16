@@ -199,17 +199,17 @@ class DataLoaderLite:
 
 if __name__=="__main__":
 
-    model = GPT(GPTConfig())
-    model.eval()
-    model.to("cuda")
-
-    max_length = 30
-    num_return_seq = 5
+    
 
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
     print(f"using device: {device}")
+
+    model = GPT(GPTConfig())
+    model.eval()
+    model.to(device)
+    model = torch.compile(model)
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
