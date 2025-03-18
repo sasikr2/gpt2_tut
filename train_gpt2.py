@@ -218,7 +218,7 @@ if __name__=="__main__":
 
     train_loader = DataLoaderLite(B=16, T=1024)
     torch.set_float32_matmul_precision("high")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
     for i in range(50):
         to= time.time()
         x, y =  train_loader.next_batch()
@@ -229,11 +229,12 @@ if __name__=="__main__":
             logits, loss = model(x, y)
             # import code; code.interact(local=locals())
         loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1-to)*1000 # in msec
         tokens_per_sec = (train_loader.B * train_loader.T) / (t1-to)
-        print(f"step {i} loss {loss}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:2f}")
+        print(f"step: {i:4d} | loss: {loss:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:2f}")
 
     # loss reaches from 11 to 6
