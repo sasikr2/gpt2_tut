@@ -207,10 +207,10 @@ if __name__=="__main__":
         device = "cuda"
     print(f"using device: {device}")
 
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     model.eval()
     model.to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
