@@ -6,7 +6,7 @@ from torch.nn import functional as F
 import tiktoken
 import time 
 import numpy as np
-
+import inspect
 class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
     def __init__(self, config):
         super().__init__()
@@ -169,6 +169,30 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, vocab_size), target.view(-1))
         return logits, loss
 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        params_dict = {pn:p for pn, p in self.named_parameters()}
+        params_dict = {pn:p for pn, p in params_dict.items() if p.requires_grad}
+
+        # decay params which have dim 2 and more like embedding and matrix multiplications
+        decay_params = [p for p in params_dict.values() if p.dim() >= 2]
+        no_decay_params = [p for p in params_dict.values() if p.dim() < 2]
+
+        # params for decay or no decay
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"Number of decay param tensors: {len(decay_params)} | {num_decay_params} parameters")
+        print(f"Number of no decay param tensors: {len(no_decay_params)} | {num_no_decay_params} parameters")
+
+        params_config = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0}
+        ]
+        fused_adam = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        fused_adam =  True if device_type == "cuda" else False
+        optimizer = torch.optim.AdamW(params_config, lr=learning_rate, betas=betas, eps=1e-8, fused=fused_adam)
+        return optimizer
+
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -196,12 +220,31 @@ class DataLoaderLite:
             self.curr_position_ptr = 0
         return x, y
 
+warmup_steps = 10
+lr_max = 3e-4
+lr_min = lr_max * 0.1 # as in gpt paper it's 10% of max_lr
+lr_decay_steps = 50
+
+
+# warmup_steps + cosine decay + lr_min
+def learning_rate_cosine_decay_schedule(iter):
+    
+    if iter < warmup_steps:
+        return (iter+1)*lr_max/(1+warmup_steps) # +1 to avoid division by zero
+    elif iter > lr_decay_steps:
+        return lr_min
+    else:
+        decay_ratio = (iter-warmup_steps)/(lr_decay_steps-warmup_steps)
+        curr_lr = lr_min + 0.5*(lr_max-lr_min)*(1+math.cos(math.pi*decay_ratio))
+        return curr_lr
+    
+
 
 
 if __name__=="__main__":
 
     
-
+    max_steps = 60
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
@@ -218,12 +261,21 @@ if __name__=="__main__":
 
     train_loader = DataLoaderLite(B=16, T=1024)
     torch.set_float32_matmul_precision("high")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
-    for i in range(50):
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
+    # print({pn:p.shape for pn, p in model.named_parameters()})
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=lr_max, betas=(0.9,0.95), device_type=device)
+
+    for step in range(max_steps):
         to= time.time()
         x, y =  train_loader.next_batch()
         x = x.to(device)
         y = y.to(device)
+
+        lr = learning_rate_cosine_decay_schedule(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+
         optimizer.zero_grad()
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
@@ -235,6 +287,6 @@ if __name__=="__main__":
         t1 = time.time()
         dt = (t1-to)*1000 # in msec
         tokens_per_sec = (train_loader.B * train_loader.T) / (t1-to)
-        print(f"step: {i:4d} | loss: {loss:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:2f}")
+        print(f"step: {step:4d} | lr: {lr:.6f} | loss: {loss:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:2f}")
 
     # loss reaches from 11 to 6
