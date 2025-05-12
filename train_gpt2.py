@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 import math
+import os
+import sys
 import torch
 import torch.nn  as nn
 from torch.nn import functional as F
@@ -7,6 +9,16 @@ import tiktoken
 import time 
 import numpy as np
 import inspect
+
+import wandb
+
+import logging 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import wandb
+
+
 class CausalSelfAttentionBlock(nn.Module): # Multi Head Attention
     def __init__(self, config):
         super().__init__()
@@ -87,10 +99,11 @@ class GPT(nn.Module):
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # weight sharing scheme
+        # weight sharing scheme , wirght tying
         self.transformer.wte.weight = self.lm_head.weight
         # init params
         self.apply(self._init_weights)
+
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -106,7 +119,7 @@ class GPT(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type):
         from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+        logger.info("loading weights from pretrained gpt: %s" % model_type)
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
@@ -134,8 +147,8 @@ class GPT(nn.Module):
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
 
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # print(sd_keys_hf)
-        # print(sd_keys)
+        # logger.info(sd_keys_hf)
+        # logger.info(sd_keys)
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
@@ -180,8 +193,8 @@ class GPT(nn.Module):
         # params for decay or no decay
         num_decay_params = sum(p.numel() for p in decay_params)
         num_no_decay_params = sum(p.numel() for p in no_decay_params)
-        print(f"Number of decay param tensors: {len(decay_params)} | {num_decay_params} parameters")
-        print(f"Number of no decay param tensors: {len(no_decay_params)} | {num_no_decay_params} parameters")
+        logger.info(f"Number of decay param tensors: {len(decay_params)} | {num_decay_params} parameters")
+        logger.info(f"Number of no decay param tensors: {len(no_decay_params)} | {num_no_decay_params} parameters")
 
         params_config = [
             {"params": decay_params, "weight_decay": weight_decay},
@@ -193,21 +206,31 @@ class GPT(nn.Module):
         return optimizer
 
 
-
 class DataLoaderLite:
-    def __init__(self, B, T):
-        with open("./input.txt", "r") as f:
-            raw_text = f.read()
-            f.close()
+    def __init__(self, B, T, split="train", device="cpu"):
+
+        self.device = device
+        file_list = os.listdir("./edu_fineweb10B")
+        file_list = ["./edu_fineweb10B/"+f for f in file_list]
+        shard_list = [f for f in file_list if f.find(split) != -1]
+        logger.info(f"{split} Shard length: {len(shard_list)}")
 
         self.B = B
         self.T = T
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(raw_text)
-        self.tokens = torch.tensor(tokens)
+        self.shard_list = shard_list
+        self.curr_shard_ptr = 0
+        self.tokens = self.load_tokens(self.shard_list[self.curr_shard_ptr])
         self.curr_position_ptr = 0
-        print(f"tokens length {len(self.tokens)}")
-        print(f"1 epoch ={len(self.tokens)//(B*T)}")
+
+    def reset_shard(self):
+        # logger.info(f"Resetting shard: {self.curr_shard_ptr}")
+        if self.curr_shard_ptr >= len(self.shard_list):
+            self.curr_shard_ptr = 0 
+        else:
+            self.curr_shard_ptr += 1
+
+        self.tokens = self.load_tokens(self.shard_list[self.curr_shard_ptr])
+        self.curr_position_ptr = 0
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -217,76 +240,181 @@ class DataLoaderLite:
         self.curr_position_ptr = self.curr_position_ptr + B*T+1
 
         if self.curr_position_ptr+B*T+1 > len(self.tokens):
-            self.curr_position_ptr = 0
+            self.reset_shard()
         return x, y
 
-warmup_steps = 10
-lr_max = 3e-4
-lr_min = lr_max * 0.1 # as in gpt paper it's 10% of max_lr
-lr_decay_steps = 50
-
-
-# warmup_steps + cosine decay + lr_min
-def learning_rate_cosine_decay_schedule(iter):
+    def load_tokens(self, shard_path):
+        tokens_np = np.load(shard_path)
+        tokens_np = tokens_np.astype(np.long)
+        tokens_tensor = torch.from_numpy(tokens_np)
+        tokens_tensor = tokens_tensor.to(self.device)
+        # logger.info(tokens_tensor.dtype)
+        return tokens_tensor
     
-    if iter < warmup_steps:
-        return (iter+1)*lr_max/(1+warmup_steps) # +1 to avoid division by zero
-    elif iter > lr_decay_steps:
-        return lr_min
-    else:
-        decay_ratio = (iter-warmup_steps)/(lr_decay_steps-warmup_steps)
-        curr_lr = lr_min + 0.5*(lr_max-lr_min)*(1+math.cos(math.pi*decay_ratio))
-        return curr_lr
-    
-
-
 
 if __name__=="__main__":
 
-    
-    max_steps = 60
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
-    print(f"using device: {device}")
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    logger.info(f"Current Device: {device}")
 
-    model = GPT(GPTConfig(vocab_size=50304))
-    model.eval()
+    model = GPT(GPTConfig(vocab_size=50304))        # increase vocab size from 50257 to 50304 just only for hardware optimization
     model.to(device)
-    # model = torch.compile(model)
+    model = torch.compile(model)
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    train_loader = DataLoaderLite(B=16, T=1024)
+    # TODO move it to config
+    training_config = {
+        "out_dir": "/clearml_agent_cache/storage_manager/dynamic_lm_exp_shashik/self_exp/gpt2_tut",
+        "batch_size": 32,
+        "total_batch_size": 2**12,   # total batch size for all GPUs, gradient accumulation
+        "eval_iters": 200,
+        "eval_interval": 500,
+        "log_interval": 5,
+        "wandb_log": True,
+
+        "learning_rate": 6e-4, # max learning rate
+        "max_iters": 60000, # total number of training iterations
+        "weight_decay": 1e-1,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "grad_clip": 1.0, # clip gradients at this value, or disable if == 0.0
+
+        "warmup_steps": 2000
+    }
+    out_dir = training_config["out_dir"]
+    batch_size = training_config["batch_size"]
+    eval_iters = training_config["eval_iters"]
+    eval_interval = training_config["eval_interval"]
+    log_interval = training_config["log_interval"]
+    wandb_log = training_config["wandb_log"]
+
+    learning_rate = training_config["learning_rate"] # max learning rate
+    max_iters = training_config["max_iters"] # total number of training iterations
+    weight_decay = training_config["weight_decay"]
+    beta1 = training_config["beta1"]
+    beta2 = training_config["beta2"]
+    grad_clip = training_config["grad_clip"] # clip gradients at this value, or disable if == 0.0
+
+    # learning rate scheduler config
+    warmup_steps = training_config["warmup_steps"]
+    lr_min = learning_rate * 0.1 # as in gpt paper it's 10% of max_lr should be ~= learning_rate/10 per Chinchilla
+    lr_decay_steps = max_iters # should be ~= max_iters per Chinchilla
+
+    ###### learning rate schedule ######
+    # warmup_steps + cosine decay + lr_min
+    def learning_rate_cosine_decay_schedule(iter):
+        if iter < warmup_steps:
+            return (iter+1)*learning_rate/(1+warmup_steps) # +1 to avoid division by zero
+        elif iter > lr_decay_steps:
+            return lr_min
+        else:
+            decay_ratio = (iter-warmup_steps)/(lr_decay_steps-warmup_steps)
+            curr_lr = lr_min + 0.5*(learning_rate-lr_min)*(1+math.cos(math.pi*decay_ratio))
+            return curr_lr
+
+    # helps estimate an arbitrarily accurate loss over either split using many batches
+    @torch.no_grad()
+    def estimate_loss():
+        out = {}
+        model.eval()
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                if split == "train":
+                    X, Y = train_loader.next_batch()
+                else:
+                    X, Y = val_loader.next_batch()
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+        model.train()
+        return out
+
+    if wandb_log:
+        run = wandb.init(
+            entity="rc_speech",
+            project="llm-test",
+            name="gpt2-tut-train-1-2025-05-12",
+            config=training_config
+        )
+
+    train_loader = DataLoaderLite(B=batch_size, T=1024, split="train", device=device)
+    val_loader = DataLoaderLite(B=batch_size, T=1024, split="val", device=device)
     torch.set_float32_matmul_precision("high")
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
-    # print({pn:p.shape for pn, p in model.named_parameters()})
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=lr_max, betas=(0.9,0.95), device_type=device)
+    # logger.info({pn:p.shape for pn, p in model.named_parameters()})
+    optimizer = model.configure_optimizers(weight_decay=weight_decay, learning_rate=learning_rate, betas=(beta1,beta2), device_type=device)
 
-    for step in range(max_steps):
+    total_batch_size = training_config["total_batch_size"]
+    grad_accum_steps = total_batch_size // batch_size
+    logger.info(f"Total batch size: {total_batch_size} | Grad accum steps: {grad_accum_steps}")
+
+    best_val_loss = float('inf')
+    for step in range(max_iters):
         to= time.time()
-        x, y =  train_loader.next_batch()
-        x = x.to(device)
-        y = y.to(device)
 
+        # optimizer and lr setup
         lr = learning_rate_cosine_decay_schedule(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
+        # gradient accumulation
+        loss_accumalation = 0
+        for mini_batch in range(grad_accum_steps):
+            x, y =  train_loader.next_batch()
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss/grad_accum_steps
+            loss.backward()
+            loss_accumalation += loss.detach()
 
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-            # import code; code.interact(local=locals())
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # Returns the original gradient norm before clipping (stored in the variable norm)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         torch.cuda.synchronize()
+
+        # clear the gradient to free memory
+        optimizer.zero_grad()
+        
         t1 = time.time()
         dt = (t1-to)*1000 # in msec
-        tokens_per_sec = (train_loader.B * train_loader.T) / (t1-to)
-        print(f"step: {step:4d} | lr: {lr:.6f} | loss: {loss:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:2f}")
+        tokens_per_sec = (train_loader.B * train_loader.T*grad_accum_steps) / (t1-to)
 
+        if step % log_interval == 0:
+            logger.info(f"step: {step:4d} | lr: {lr:.6f} | loss: {loss_accumalation:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:2f}")
+        if step % eval_interval == 0:
+            losses = estimate_loss()
+            logger.info(f"step: {step:4d} | train loss: {losses['train']:.4f} | val loss: {losses['val']:.4f}")
+            if wandb_log:
+                    wandb.log({
+                        "step": step,
+                        "norm": norm,
+                        "lr": lr,
+                        # "dt": dt,
+                        # "tok/sec": tokens_per_sec,
+                        "train/loss": losses['train'],
+                        "val/loss": losses['val']
+                    })
+            if losses['val'] < best_val_loss:
+                best_val_loss = losses['val']
+                if step > 0:
+                    checkpoint = {
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model.config,
+                        'iter_num': step,
+                        'best_val_loss': best_val_loss,
+                        'config': training_config,
+                        }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            
     # loss reaches from 11 to 6

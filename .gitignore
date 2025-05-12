@@ -1,2 +1,17 @@
 .ipynb_checkpoints
 /edu_fineweb10B
+/wandb
+/data
+/models
+/logs
+/results
+/checkpoints
+/results
+*.pt
+*.pth
+*.pt.gz
+*.pth.gz
+*.pt.tar
+*.pth.tar
+*.pt.tar.gz
+*.pth.tar.gz
