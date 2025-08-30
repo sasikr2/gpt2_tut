@@ -13,7 +13,6 @@ This repository serves as a learning resource for understanding the GPT-2 archit
 - **Complete GPT-2 Implementation**: Full implementation of the GPT-2 architecture from scratch
 - **Multi-GPU Training**: Distributed training support using PyTorch DDP
 - **Educational Components**: Basic transformer implementations for learning
-- **Interactive Notebooks**: Jupyter notebooks for exploring GPT-2 behavior
 - **Data Processing**: Utilities for downloading and chunking training data
 - **Validation Tools**: Scripts for creating validation datasets
 
